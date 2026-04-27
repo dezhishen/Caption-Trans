@@ -8,12 +8,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import '../services/settings_service.dart';
 import '../services/translation/translation_failure.dart';
-    final screenWidth = MediaQuery.of(context).size.width;
 import '../services/translation/translation_service.dart';
 import '../blocs/transcription/transcription_bloc.dart';
 import '../blocs/transcription/transcription_event.dart';
-    final bool isWideLayout = screenWidth >= 1180;
-    final bool isCompactStepOne = isMobilePlatform || screenWidth < 960;
 import '../blocs/transcription/transcription_state.dart';
 import '../blocs/translation/translation_bloc.dart';
 import '../blocs/translation/translation_event.dart';
@@ -21,315 +18,219 @@ import '../blocs/translation/translation_state.dart';
 import '../core/constants.dart';
 import 'package:caption_trans/l10n/app_localizations.dart';
 import '../core/utils/srt_parser.dart';
-              constraints: const BoxConstraints(maxWidth: 1320),
-              child: isWideLayout
-                  ? Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          flex: 7,
-                          child: _buildWorkflowColumn(context, isCompactStepOne),
-                        ),
-                        const SizedBox(width: 20),
-                        Expanded(flex: 4, child: _buildQueueColumn(context)),
-                      ],
-                    )
-                  : Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        _buildWorkflowColumn(context, isCompactStepOne),
-                        const SizedBox(height: 16),
-                        _buildQueueColumn(context),
-                      ],
-                    ),
+import '../models/translation_config.dart';
+import '../models/whisper_download_source.dart';
+import 'widgets/download_source_dialog.dart';
+import 'widgets/video_picker_card.dart';
+import 'widgets/transcription_panel.dart';
+import 'widgets/translation_panel.dart';
+import 'widgets/subtitle_preview.dart';
+import 'widgets/settings_dialog.dart';
+import 'project_list_page.dart';
+import '../models/project.dart';
+import 'package:uuid/uuid.dart';
+import '../blocs/project/project_bloc.dart';
+import '../blocs/project/project_event.dart';
+import '../blocs/project/project_state.dart';
+import '../models/subtitle_segment.dart';
+import '../services/update_service.dart';
+import 'widgets/update_dialog.dart';
+
+/// Main application page with step-by-step workflow.
+class HomePage extends StatefulWidget {
+  final void Function(Locale) onLocaleChanged;
+  final SettingsService settingsService;
+
+  const HomePage({
+    super.key,
+    required this.onLocaleChanged,
+    required this.settingsService,
+  });
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _BatchQueueItem {
+  final String videoPath;
+  final String fileName;
+  _BatchQueueStage stage;
+  int transcriptionAttempts;
+  int translationAttempts;
+  int exportAttempts;
+  String? lastError;
+
+  _BatchQueueItem({required this.videoPath})
+    : fileName = p.basename(videoPath),
+      stage = _BatchQueueStage.pending,
+      transcriptionAttempts = 0,
+      translationAttempts = 0,
+      exportAttempts = 0,
+      lastError = null;
+}
+
+enum _BatchQueueStage {
+  pending,
+  transcribing,
+  transcriptionFailed,
+  transcriptionDone,
+  translating,
+  translationFailed,
+  exporting,
+  exportFailed,
+  completed,
+  skipped,
+}
+
+class _HomePageState extends State<HomePage> {
+  String _selectedModel = AppConstants.defaultWhisperModel;
+  String _sourceVideoLanguage = 'ja';
+  String _targetLanguage = 'zh';
+  String _apiKey = '';
+  String _targetModel = 'gemini-2.5-flash-lite';
+  String _llmProvider = 'Gemini (Google)';
+  String _llmBaseUrl =
+      'https://generativelanguage.googleapis.com/v1beta/openai';
+  bool _bilingual = true;
+  int _batchSize = 15;
+  List<String> _availableModels = [];
+  bool _isLoadingModels = false;
+  Map<String, ProviderCredential> _savedProviderCredentials = {};
+  final UpdateService _updateService = UpdateService();
+  final List<_BatchQueueItem> _batchQueue = <_BatchQueueItem>[];
+
+  int _currentQueueIndex = -1;
+  bool _autoProcessTranscription = false;
+  bool _autoProcessTranslation = false;
+  int _maxStageAttempts = 3;
+  bool _isQueueRunning = false;
+
+  Project? _activeProject;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkForUpdatesSilently();
+    });
+  }
+
+  @override
+  void dispose() {
+    _updateService.dispose();
+    super.dispose();
+  }
+
+  void _loadSettings() {
+    final savedCredentials = widget.settingsService.llmProviderCredentials;
+    final provider = widget.settingsService.llmProvider;
+    final savedForProvider = savedCredentials[provider];
+
+    setState(() {
+      _savedProviderCredentials = savedCredentials;
+      _targetModel = widget.settingsService.geminiModel;
+      _llmProvider = provider;
+      _llmBaseUrl =
+          savedForProvider?.baseUrl ?? widget.settingsService.llmBaseUrl;
+      _apiKey = savedForProvider?.apiKey ?? widget.settingsService.geminiApiKey;
+      _targetLanguage = widget.settingsService.targetLanguage;
+      _bilingual = widget.settingsService.bilingual;
+      _batchSize = widget.settingsService.batchSize;
+      _autoProcessTranscription =
+          widget.settingsService.autoProcessTranscription;
+      _autoProcessTranslation = widget.settingsService.autoProcessTranslation;
+      _maxStageAttempts = widget.settingsService.batchMaxRetries;
+    });
+
+    if (_apiKey.isNotEmpty) {
+      _fetchModels();
+    }
+  }
+
+  Future<void> _checkForUpdatesSilently() async {
+    if (!UpdateService.supportsAutoUpdateCheck || !mounted) {
+      return;
+    }
+
+    final lastCheckedAt = widget.settingsService.lastUpdateCheckAt;
+    if (!UpdateService.shouldPerformAutoCheck(lastCheckedAt)) {
+      return;
+    }
+
+    try {
+      final result = await _updateService.checkForUpdates();
+      await widget.settingsService.setLastUpdateCheckAt(DateTime.now());
+      if (!mounted || !result.isUpdateAvailable) {
+        return;
+      }
+
+      await showUpdateAvailableDialog(context, result);
+    } catch (_) {
+      await widget.settingsService.setLastUpdateCheckAt(DateTime.now());
+    }
+  }
+
+  bool _isModelFetchFailed(List<String> models) {
+    if (models.isEmpty) return true;
+    final first = models.first.toLowerCase();
+    return models.length == 1 &&
+        first.contains('failed') &&
+        first.contains('api key');
+  }
+
+  void _handleProviderChanged(String provider) {
+    final savedCredential = _savedProviderCredentials[provider];
+    final baseUrl =
+        savedCredential?.baseUrl ?? (defaultLlmBaseUrls[provider] ?? '');
+    final apiKey = savedCredential?.apiKey ?? '';
+
+    setState(() {
+      _llmProvider = provider;
+      _llmBaseUrl = baseUrl;
+      _apiKey = apiKey;
+      _targetModel = '';
+      _availableModels = [];
+    });
+
+    widget.settingsService.setLlmProvider(provider);
+    widget.settingsService.setLlmBaseUrl(baseUrl);
+    widget.settingsService.setGeminiApiKey(apiKey);
+  }
+
+  Future<void> _saveProviderCredentialIfNeeded() async {
+    if (_llmProvider.isEmpty || _llmBaseUrl.isEmpty || _apiKey.isEmpty) return;
+
+    final credential = ProviderCredential(
+      baseUrl: _llmBaseUrl.trim(),
+      apiKey: _apiKey.trim(),
+    );
+    await widget.settingsService.saveLlmProviderCredential(
+      _llmProvider,
+      credential,
+    );
+
+    if (mounted) {
+      setState(() {
+        _savedProviderCredentials[_llmProvider] = credential;
+      });
+    }
+  }
+
+  Future<void> _fetchModels({bool saveProviderCredential = false}) async {
+    if (_apiKey.isEmpty) return;
+
+    setState(() => _isLoadingModels = true);
+    try {
+      final service = TranslationService();
+      final models = await service.listModels(
+        TranslationConfig(
           providerId: _llmProvider,
           apiKey: _apiKey,
           baseUrl: _llmBaseUrl,
           sourceLanguage: 'ja', // dummy
           targetLanguage: 'zh', // dummy
         ),
-
-  Widget _buildWorkflowColumn(BuildContext context, bool isCompactStepOne) {
-    final l10n = AppLocalizations.of(context)!;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _buildSectionHeader(
-          context,
-          icon: Icons.video_library_rounded,
-          title: 'Step 1: ${l10n.stepSelectVideo}',
-          number: '1',
-          trailing: IconButton(
-            icon: const Icon(Icons.settings_rounded),
-            onPressed: () => _showSettings(context),
-            tooltip: l10n.settings,
-          ),
-        ),
-        const SizedBox(height: 12),
-        _buildStepOnePanels(isCompactStepOne),
-        const SizedBox(height: 12),
-        _buildQueueAutomationSettingsCard(context),
-        const SizedBox(height: 32),
-        _buildSectionHeader(
-          context,
-          icon: Icons.mic_rounded,
-          title: 'Step 2: ${l10n.stepExtractSubtitles}',
-          number: '2',
-        ),
-        const SizedBox(height: 12),
-        BlocBuilder<TranscriptionBloc, TranscriptionState>(
-          builder: (context, state) {
-            return TranscriptionPanel(
-              state: state,
-              selectedModel: _selectedModel,
-              selectedSourceLanguage: _sourceVideoLanguage,
-              onModelChanged: (model) => setState(() => _selectedModel = model),
-              onSourceLanguageChanged: (language) =>
-                  setState(() => _sourceVideoLanguage = language),
-              onStartTranscription: () {
-                _handleStartTranscription(context);
-              },
-            );
-          },
-        ),
-        const SizedBox(height: 32),
-        _buildSectionHeader(
-          context,
-          icon: Icons.translate_rounded,
-          title: 'Step 3: ${l10n.stepTranslate}',
-          number: '3',
-        ),
-        const SizedBox(height: 12),
-        BlocConsumer<TranslationBloc, TranslationState>(
-          listener: (context, state) {
-            final transcriptionState = context.read<TranscriptionBloc>().state;
-            final currentConfig = _buildCurrentTranslationConfig(
-              transcriptionState,
-            );
-
-            if (state is TranslationError) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(state.message),
-                  backgroundColor: Colors.red.shade700,
-                ),
-              );
-              if (state.partialSegments != null) {
-                _persistProjectTranslation(
-                  context,
-                  segments: state.partialSegments!,
-                  config: state.config ?? currentConfig,
-                );
-              }
-            } else if (state is TranslationInProgress &&
-                state.partialSegments != null) {
-              _persistProjectTranslation(
-                context,
-                segments: state.partialSegments!,
-                config: currentConfig,
-              );
-            } else if (state is TranslationComplete) {
-              _persistProjectTranslation(
-                context,
-                segments: state.translatedSegments,
-                config: state.config,
-              );
-            } else if (state is TranslationCancelled &&
-                state.partialSegments != null) {
-              _persistProjectTranslation(
-                context,
-                segments: state.partialSegments!,
-                config: state.config ?? currentConfig,
-              );
-            }
-
-            unawaited(_handleBatchTranslationState(context, state));
-          },
-          builder: (context, translationState) {
-            return BlocBuilder<TranscriptionBloc, TranscriptionState>(
-              builder: (context, transcriptionState) {
-                final effectiveSegments = _resolveEffectiveSegments(
-                  translationState,
-                  transcriptionState,
-                );
-                final translatedSegmentCount = _countSuccessfulTranslatedSegments(
-                  effectiveSegments,
-                );
-                final failedSegmentCount = _countFailedTranslatedSegments(
-                  effectiveSegments,
-                );
-                final totalSegmentCount = effectiveSegments?.length ?? 0;
-
-                return TranslationPanel(
-                  transcriptionState: transcriptionState,
-                  translationState: translationState,
-                  translatedSegmentCount: translatedSegmentCount,
-                  failedSegmentCount: failedSegmentCount,
-                  totalSegmentCount: totalSegmentCount,
-                  llmProvider: _llmProvider,
-                  llmBaseUrl: _llmBaseUrl,
-                  onLlmProviderChanged: (provider) {
-                    _handleProviderChanged(provider);
-                  },
-                  onLlmBaseUrlChanged: (url) {
-                    setState(() => _llmBaseUrl = url);
-                    widget.settingsService.setLlmBaseUrl(url);
-                  },
-                  onCheckModels: () {
-                    _fetchModels(saveProviderCredential: true);
-                  },
-                  targetLanguage: _targetLanguage,
-                  apiKey: _apiKey,
-                  targetModel: _targetModel,
-                  availableModels: _availableModels,
-                  isLoadingModels: _isLoadingModels,
-                  onTargetLanguageChanged: (lang) {
-                    setState(() => _targetLanguage = lang);
-                    widget.settingsService.setTargetLanguage(lang);
-                  },
-                  onApiKeyChanged: (key) {
-                    setState(() => _apiKey = key);
-                    widget.settingsService.setGeminiApiKey(key);
-                  },
-                  onTargetModelChanged: (model) {
-                    setState(() => _targetModel = model);
-                    widget.settingsService.setGeminiModel(model);
-                  },
-                  batchSize: _batchSize,
-                  onBatchSizeChanged: (size) {
-                    setState(() => _batchSize = size);
-                    widget.settingsService.setBatchSize(size);
-                  },
-                  onStartTranslation: () {
-                    _startTranslation(
-                      context,
-                      translationState: translationState,
-                      transcriptionState: transcriptionState,
-                    );
-                  },
-                  onRetryFailedTranslation: failedSegmentCount > 0
-                      ? () {
-                          _startTranslation(
-                            context,
-                            translationState: translationState,
-                            transcriptionState: transcriptionState,
-                            retryFailedOnly: true,
-                          );
-                        }
-                      : null,
-                  onRestartTranslation: () {
-                    _startTranslation(
-                      context,
-                      translationState: translationState,
-                      transcriptionState: transcriptionState,
-                      restart: true,
-                    );
-                  },
-                  onCancelTranslation: () {
-                    context.read<TranslationBloc>().add(
-                      const CancelTranslation(),
-                    );
-                  },
-                );
-              },
-            );
-          },
-        ),
-        const SizedBox(height: 32),
-        _buildSectionHeader(
-          context,
-          icon: Icons.subtitles_rounded,
-          title: 'Step 4: ${l10n.stepPreviewExport}',
-          number: '4',
-        ),
-        const SizedBox(height: 12),
-        _buildPreviewAndExport(context),
-      ],
-    );
-  }
-
-  Widget _buildQueueColumn(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _buildBatchQueuePanel(context),
-        const SizedBox(height: 48),
-      ],
-    );
-  }
-
-  Widget _buildQueueAutomationSettingsCard(BuildContext context) {
-    final l10n = AppLocalizations.of(context)!;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              l10n.queueAutomationSettingsTitle,
-              style: Theme.of(
-                context,
-              ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            CheckboxListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text(l10n.autoProcessExtractionQueueTitle),
-              subtitle: Text(l10n.autoProcessExtractionQueueSubtitle),
-              value: _autoProcessTranscription,
-              onChanged: (value) {
-                final bool next = value ?? false;
-                setState(() {
-                  _autoProcessTranscription = next;
-                  if (_autoProcessTranscription && _batchQueue.isNotEmpty) {
-                    _isQueueRunning = true;
-                    if (_currentQueueIndex < 0) {
-                      _currentQueueIndex = 0;
-                    }
-                  } else if (!_autoProcessTranscription) {
-                    _isQueueRunning = false;
-                  }
-                });
-                widget.settingsService.setAutoProcessTranscription(next);
-                _tryStartQueue(context);
-              },
-            ),
-            CheckboxListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text(l10n.autoProcessTranslationQueueTitle),
-              subtitle: Text(l10n.autoProcessTranslationQueueSubtitle),
-              value: _autoProcessTranslation,
-              onChanged: (value) {
-                final bool next = value ?? false;
-                setState(() {
-                  _autoProcessTranslation = next;
-                });
-                widget.settingsService.setAutoProcessTranslation(next);
-              },
-            ),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text(l10n.maxRetriesPerStage(_maxStageAttempts)),
-              subtitle: Slider(
-                value: _maxStageAttempts.toDouble(),
-                min: 1,
-                max: 10,
-                divisions: 9,
-                label: '$_maxStageAttempts',
-                onChanged: (value) {
-                  final int next = value.round();
-                  setState(() {
-                    _maxStageAttempts = next;
-                  });
-                  widget.settingsService.setBatchMaxRetries(next);
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
       );
       final failed = _isModelFetchFailed(models);
 
@@ -1182,6 +1083,68 @@ import '../core/utils/srt_parser.dart';
                             icon: const Icon(Icons.close_rounded, size: 18),
                           ),
                   );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+            Divider(height: 1, color: Colors.white.withValues(alpha: 0.08)),
+            const SizedBox(height: 8),
+            Text(
+              l10n.queueAutomationSettingsTitle,
+              style: Theme.of(
+                context,
+              ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(l10n.autoProcessExtractionQueueTitle),
+              subtitle: Text(l10n.autoProcessExtractionQueueSubtitle),
+              value: _autoProcessTranscription,
+              onChanged: (value) {
+                final bool next = value ?? false;
+                setState(() {
+                  _autoProcessTranscription = next;
+                  if (_autoProcessTranscription && _batchQueue.isNotEmpty) {
+                    _isQueueRunning = true;
+                    if (_currentQueueIndex < 0) {
+                      _currentQueueIndex = 0;
+                    }
+                  } else if (!_autoProcessTranscription) {
+                    _isQueueRunning = false;
+                  }
+                });
+                widget.settingsService.setAutoProcessTranscription(next);
+                _tryStartQueue(context);
+              },
+            ),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(l10n.autoProcessTranslationQueueTitle),
+              subtitle: Text(l10n.autoProcessTranslationQueueSubtitle),
+              value: _autoProcessTranslation,
+              onChanged: (value) {
+                final bool next = value ?? false;
+                setState(() {
+                  _autoProcessTranslation = next;
+                });
+                widget.settingsService.setAutoProcessTranslation(next);
+              },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(l10n.maxRetriesPerStage(_maxStageAttempts)),
+              subtitle: Slider(
+                value: _maxStageAttempts.toDouble(),
+                min: 1,
+                max: 10,
+                divisions: 9,
+                label: '$_maxStageAttempts',
+                onChanged: (value) {
+                  final int next = value.round();
+                  setState(() {
+                    _maxStageAttempts = next;
+                  });
+                  widget.settingsService.setBatchMaxRetries(next);
                 },
               ),
             ),
